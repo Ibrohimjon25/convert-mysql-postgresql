@@ -5,11 +5,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 function formatValue(value: any, type: string): string {
-  if (type === 'timestamp' || type === 'datetime') {
-    if (value === null || value === undefined) {
+  if (value === null || value === undefined || value === "null") {
+    if (type === 'timestamp' || type === 'datetime') {
       return 'CURRENT_TIMESTAMP';
     }
+    return 'NULL';
+  }
 
+  if (type === 'timestamp' || type === 'datetime') {
     let cleanValue = value;
     if (typeof value === 'string') {
       cleanValue = value.replace(/GMT\+[0-9]{4}/i, '').trim();
@@ -30,7 +33,12 @@ function formatValue(value: any, type: string): string {
   } else if (type === 'text' || type === 'varchar' || type === 'longtext') {
     return `'${value.toString().replace(/'/g, "''")}'`;
   } else if (['integer', 'bigint', 'smallint', 'numeric'].includes(type)) {
-    return value === null || value === undefined ? 'NULL' : value.toString();
+    const numValue = Number(value);
+    if (isNaN(numValue)) {
+      console.warn(`Invalid numeric value: ${value}. Using NULL.`);
+      return 'NULL';
+    }
+    return numValue.toString();
   } else {
     return `'${value}'`;
   }
@@ -38,7 +46,7 @@ function formatValue(value: any, type: string): string {
 
 @Injectable()
 export class MigrationService {
-  private readonly BATCH_SIZE = 500; // Kamaytirilgan batch hajmi
+  private readonly BATCH_SIZE = 500; 
   private readonly PROGRESS_FILE = path.join(process.cwd(), 'migration-progress.json');
 
   private async saveProgress(tableName: string, lastOffset: number): Promise<void> {
@@ -78,51 +86,107 @@ export class MigrationService {
     const tables = await mysqlConnection.query('SHOW TABLES');
     const tableNames = tables.map((table) => Object.values(table)[0]);
 
-    const graph = new Map<string, Set<string>>();
+    // Jadvallar va ularning bog'liqliklarini saqlash uchun Map
+    const dependencies = new Map<string, Set<string>>();
+    const reverseDependencies = new Map<string, Set<string>>();
+
+    // Barcha jadvallar uchun bo'sh Set yaratish
+    tableNames.forEach(table => {
+      dependencies.set(table, new Set());
+      reverseDependencies.set(table, new Set());
+    });
+
+    // Bog'liqliklarni aniqlash
     for (const tableName of tableNames) {
       const foreignKeys = await mysqlConnection.query(`
-        SELECT DISTINCT REFERENCED_TABLE_NAME
+        SELECT DISTINCT 
+          TABLE_NAME,
+          REFERENCED_TABLE_NAME
         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-        WHERE TABLE_NAME = ?
+        WHERE TABLE_SCHEMA = ? 
+          AND TABLE_NAME = ?
           AND REFERENCED_TABLE_NAME IS NOT NULL
-      `, [tableName]);
+      `, [mysqlConfig.database, tableName]);
 
-      graph.set(tableName, new Set(foreignKeys.map((fk) => fk.REFERENCED_TABLE_NAME)));
+      for (const fk of foreignKeys) {
+        const referencedTable = fk.REFERENCED_TABLE_NAME;
+        dependencies.get(tableName)?.add(referencedTable);
+        reverseDependencies.get(referencedTable)?.add(tableName);
+      }
     }
 
+    // Topological sort
     const order: string[] = [];
     const visited = new Set<string>();
     const visiting = new Set<string>();
 
-    const dfs = async (tableName: string) => {
+    const visit = (tableName: string) => {
       if (visited.has(tableName)) return;
-      if (visiting.has(tableName)) throw new Error(`Circular dependency detected: ${tableName}`);
+      if (visiting.has(tableName)) {
+        console.warn(`Circular dependency detected involving table: ${tableName}`);
+        return;
+      }
 
       visiting.add(tableName);
-      for (const dependency of graph.get(tableName) || []) {
-        await dfs(dependency);
+
+      // Avval bog'liq jadvallarni ko'chirish
+      for (const dep of dependencies.get(tableName) || []) {
+        visit(dep);
       }
+
       visiting.delete(tableName);
       visited.add(tableName);
       order.push(tableName);
     };
 
-    for (const tableName of tableNames) {
-      await dfs(tableName);
+    // Avval hech qanday boshqa jadvalga bog'liq bo'lmagan jadvallardan boshlash
+    const rootTables = tableNames.filter(table => 
+      (dependencies.get(table)?.size || 0) === 0
+    );
+
+    // Agar root jadvallar bo'lmasa, istalgan jadvalni boshlang'ich nuqta sifatida olish
+    const startTables = rootTables.length > 0 ? rootTables : tableNames;
+
+    for (const table of startTables) {
+      visit(table);
     }
 
+    // Qolgan jadvallarni ham qo'shish
+    tableNames.forEach(table => {
+      if (!visited.has(table)) {
+        visit(table);
+      }
+    });
+
+    console.log('Migration order:', order);
     return order;
   }
 
   private async insertBatch(transactionalEntitymanager: any, tableName: string, columns: any[], data: any[]): Promise<void> {
-    const columnNames = columns.map(col => `"${col.COLUMN_NAME}"`).join(', ');
-    let valuesSQL = '';
-    for (const row of data) {
-      const values = columns.map(col => formatValue(row[col.COLUMN_NAME], col['DATA_TYPE'].toLowerCase()));
-      valuesSQL += `(${values.join(', ')}), `;
+    try {
+      const columnNames = columns.map(col => `"${col.COLUMN_NAME}"`).join(', ');
+      let valuesSQL = '';
+      for (const row of data) {
+        const values = columns.map(col => {
+          try {
+            return formatValue(row[col.COLUMN_NAME], col['DATA_TYPE'].toLowerCase());
+          } catch (err) {
+            console.error(`Error formatting value for column ${col.COLUMN_NAME} in table ${tableName}:`, {
+              value: row[col.COLUMN_NAME],
+              type: col['DATA_TYPE'].toLowerCase(),
+              error: err.message
+            });
+            throw err;
+          }
+        });
+        valuesSQL += `(${values.join(', ')}), `;
+      }
+      valuesSQL = valuesSQL.trim().slice(0, -1);
+      await transactionalEntitymanager.query(`INSERT INTO "${tableName}" (${columnNames}) VALUES ${valuesSQL}`);
+    } catch (error) {
+      console.error(`Error in insertBatch for table ${tableName}:`, error);
+      throw error;
     }
-    valuesSQL = valuesSQL.trim().slice(0, -1);
-    await transactionalEntitymanager.query(`INSERT INTO "${tableName}" (${columnNames}) VALUES ${valuesSQL}`);
   }
 
   async migrateData(): Promise<{ success: boolean; message: string }> {
@@ -278,12 +342,26 @@ export class MigrationService {
         REFERENCED_TABLE_NAME,
         REFERENCED_COLUMN_NAME
       FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-      WHERE TABLE_NAME = ? 
+      WHERE TABLE_SCHEMA = ?
+        AND TABLE_NAME = ? 
         AND REFERENCED_TABLE_NAME IS NOT NULL
-    `, [tableName]);
+    `, [mysqlConfig.database, tableName]);
 
     for (const fk of foreignKeys) {
       try {
+        const [{ exists }] = await transactionalEntityManager.query(`
+          SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.tables 
+            WHERE table_name = $1
+          ) as exists
+        `, [fk.REFERENCED_TABLE_NAME.toLowerCase()]);
+
+        if (!exists) {
+          console.warn(`Referenced table "${fk.REFERENCED_TABLE_NAME}" does not exist yet. Skipping foreign key for ${tableName}.${fk.COLUMN_NAME}`);
+          continue;
+        }
+
         await transactionalEntityManager.query(`
           ALTER TABLE "${tableName}" 
           ADD CONSTRAINT "FK_${tableName}_${fk.COLUMN_NAME}" 

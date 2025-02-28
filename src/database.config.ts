@@ -5,7 +5,7 @@ export const mysqlConfig: DataSourceOptions = {
   host: 'localhost',
   port: 3306,
   username: 'root',
-  password: '19981976',
+  password: '1',
   database: 'fake-data',
   synchronize: false,
   extra: {
@@ -21,7 +21,7 @@ export const postgresConfig: DataSourceOptions = {
   port: 5432,
   username: 'postgres',
   password: '1',
-  database: 'convert30',
+  database: 'convert3',
   synchronize: false,
   dropSchema: true,
   extra: {
