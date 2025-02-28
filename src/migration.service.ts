@@ -83,8 +83,13 @@ export class MigrationService {
   }
 
   private async getMigrationOrder(mysqlConnection: DataSource): Promise<string[]> {
-    const tables = await mysqlConnection.query('SHOW TABLES');
-    const tableNames = tables.map((table) => Object.values(table)[0]);
+    const tables = await mysqlConnection.query(`
+      SELECT TABLE_NAME 
+      FROM INFORMATION_SCHEMA.TABLES 
+      WHERE TABLE_SCHEMA = ?
+    `, [mysqlConfig.database]);
+    
+    const tableNames = tables.map((table) => table.TABLE_NAME);
 
     // Jadvallar va ularning bog'liqliklarini saqlash uchun Map
     const dependencies = new Map<string, Set<string>>();
@@ -120,20 +125,24 @@ export class MigrationService {
     const visited = new Set<string>();
     const visiting = new Set<string>();
 
-    const visit = (tableName: string) => {
+    const circularDependencies = new Set<string>();
+    
+    const visit = (tableName: string, path: Set<string> = new Set()) => {
       if (visited.has(tableName)) return;
-      if (visiting.has(tableName)) {
-        console.warn(`Circular dependency detected involving table: ${tableName}`);
+      if (path.has(tableName)) {
+        circularDependencies.add(tableName);
+        console.warn(`Circular dependency detected: ${Array.from(path).join(' -> ')} -> ${tableName}`);
         return;
       }
 
       visiting.add(tableName);
+      path.add(tableName);
 
-      // Avval bog'liq jadvallarni ko'chirish
       for (const dep of dependencies.get(tableName) || []) {
-        visit(dep);
+        visit(dep, new Set(path));
       }
 
+      path.delete(tableName);
       visiting.delete(tableName);
       visited.add(tableName);
       order.push(tableName);
@@ -158,8 +167,12 @@ export class MigrationService {
       }
     });
 
-    console.log('Migration order:', order);
-    return order;
+    // Circular dependency bo'lgan jadvallarni oxirida ko'chirish
+    const finalOrder = order.filter(table => !circularDependencies.has(table));
+    circularDependencies.forEach(table => finalOrder.push(table));
+
+    console.log('Migration order:', finalOrder);
+    return finalOrder;
   }
 
   private async insertBatch(transactionalEntitymanager: any, tableName: string, columns: any[], data: any[]): Promise<void> {
@@ -217,20 +230,126 @@ export class MigrationService {
       const tableOrder = await this.getMigrationOrder(mysqlConnection);
       const progress = await this.loadProgress();
 
+      // Umumiy progress uchun ma'lumotlar
+      let totalRecordsCount = 0;
+      let totalMigratedRecords = 0;
+      const tableRecordCounts = new Map<string, number>();
+
+      // Barcha jadvallardagi ma'lumotlar sonini hisoblash
+      console.log('Calculating total records...');
       for (const tableName of tableOrder) {
-        console.log(`Analyzing table: ${tableName}`);
-        
-        await postgresConnection.transaction(async (transactionalEntityManager) => {
-          const hasForeignKeys = await this.checkForeignKeyExists(mysqlConnection, tableName);
+        const [{ count }] = await mysqlConnection.query(
+          `SELECT COUNT(*) as count FROM \`${tableName}\``,
+        );
+        totalRecordsCount += count;
+        tableRecordCounts.set(tableName, count);
+      }
+      console.log(`Total records to migrate: ${totalRecordsCount}`);
+
+      const migratedTables = new Map<string, string>();
+      const failedTables = new Set<string>();
+
+      // Avval barcha jadvallarni va ma'lumotlarni ko'chirish
+      for (let i = 0; i < tableOrder.length; i++) {
+        const tableName = tableOrder[i];
+        try {
+          console.log(`\n=== Migrating table ${i + 1}/${tableOrder.length}: ${tableName} ===`);
+          console.log(`Overall progress: ${Math.round((totalMigratedRecords/totalRecordsCount)*100)}% (${totalMigratedRecords}/${totalRecordsCount} records)`);
           
-          if (hasForeignKeys) {
-            console.log(`Table ${tableName} has foreign key relationships, will handle dependencies`);
-            await this.migrateTableWithForeignKeys(mysqlConnection, transactionalEntityManager, tableName, progress);
-          } else {
-            console.log(`Table ${tableName} has no foreign keys, proceeding with direct migration`);
-            await this.migrateTableWithoutConstraints(mysqlConnection, transactionalEntityManager, tableName, progress);
+          await postgresConnection.transaction(async (transactionalEntityManager) => {
+            const hasForeignKeys = await this.checkForeignKeyExists(mysqlConnection, tableName);
+            if (hasForeignKeys) {
+              await this.migrateTableWithForeignKeys(mysqlConnection, transactionalEntityManager, tableName, progress);
+            } else {
+              await this.migrateTableWithoutConstraints(mysqlConnection, transactionalEntityManager, tableName, progress);
+            }
+          });
+          
+          // Jadval ma'lumotlarini umumiy progressga qo'shish
+          totalMigratedRecords += tableRecordCounts.get(tableName) || 0;
+          migratedTables.set(tableName, tableName.toLowerCase());
+          console.log(`Successfully migrated table: ${tableName}`);
+          console.log(`Overall progress after ${tableName}: ${Math.round((totalMigratedRecords/totalRecordsCount)*100)}%`);
+        } catch (error) {
+          console.error(`Failed to migrate table ${tableName}:`, error);
+          failedTables.add(tableName);
+          console.warn(`Continuing with next table after failure of ${tableName}`);
+        }
+      }
+
+      if (failedTables.size > 0) {
+        const failedTablesList = Array.from(failedTables).join(', ');
+        return {
+          success: false,
+          message: `Migration completed with errors. Failed tables: ${failedTablesList}`
+        };
+      }
+
+      // Jadvallar mavjudligini tekshirish
+      console.log('Verifying migrated tables...');
+      for (const [originalName, lowerName] of migratedTables) {
+        const [{ exists }] = await postgresConnection.query(`
+          SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = $1
+          ) as exists
+        `, [lowerName]);
+
+        if (!exists) {
+          throw new Error(`Table ${originalName} was not properly migrated (looking for ${lowerName})`);
+        }
+      }
+
+      // Failed foreign key'larni saqlash uchun
+      const failedForeignKeys: Array<{
+        tableName: string;
+        columnName: string;
+        referencedTable: string;
+        referencedColumn: string;
+      }> = [];
+
+      // So'ngra foreign key'larni qo'shish
+      console.log('Adding foreign key constraints...');
+      for (const tableName of tableOrder) {
+        if (!migratedTables.has(tableName)) {
+          console.warn(`Skipping foreign keys for non-migrated table: ${tableName}`);
+          continue;
+        }
+
+        await postgresConnection.transaction(async (transactionalEntityManager) => {
+          try {
+            const failed = await this.addForeignKeyConstraints(mysqlConnection, transactionalEntityManager, tableName);
+            failedForeignKeys.push(...failed);
+            console.log(`Successfully added foreign keys for table: ${tableName}`);
+          } catch (error) {
+            console.error(`Failed to add foreign keys for table ${tableName}:`, error);
+            console.warn('Continuing despite foreign key error');
           }
         });
+      }
+
+      // Muvaffaqiyatsiz foreign key'larni qayta qo'shishga urinish
+      if (failedForeignKeys.length > 0) {
+        console.log('Retrying failed foreign key constraints...');
+        for (const fk of failedForeignKeys) {
+          await postgresConnection.transaction(async (transactionalEntityManager) => {
+            try {
+              await transactionalEntityManager.query(`
+                ALTER TABLE "${fk.tableName}" 
+                ADD CONSTRAINT "FK_${fk.tableName}_${fk.columnName}" 
+                FOREIGN KEY ("${fk.columnName}") 
+                REFERENCES "${fk.referencedTable}" ("${fk.referencedColumn}")
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+              `);
+              console.log(`Successfully added foreign key for ${fk.tableName}.${fk.columnName}`);
+            } catch (err) {
+              console.error(`Failed to add foreign key on retry for ${fk.tableName}.${fk.columnName}:`, err);
+            }
+          });
+        }
       }
 
       if (fs.existsSync(this.PROGRESS_FILE)) {
@@ -259,118 +378,116 @@ export class MigrationService {
     tableName: string,
     progress: any
   ): Promise<void> {
-    const columns = await mysqlConnection.query(`
-      SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA, COLUMN_DEFAULT, NUMERIC_PRECISION, NUMERIC_SCALE
-      FROM INFORMATION_SCHEMA.COLUMNS 
-      WHERE TABLE_NAME = ?
-    `, [tableName]);
+    try {
+      console.log(`Starting migration for table: ${tableName}`);
+      
+      const columns = await mysqlConnection.query(`
+        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA, COLUMN_DEFAULT, NUMERIC_PRECISION, NUMERIC_SCALE
+        FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+      `, [mysqlConfig.database, tableName]);
 
-    let createTableSQL = `CREATE TABLE "${tableName}" (`;
-    const columnDefinitions = columns.map((column) => {
-      let type = column['DATA_TYPE'].toLowerCase();
-
-      switch (type) {
-        case 'int':
-          type = column.EXTRA === 'auto_increment' ? 'SERIAL' : 'INTEGER';
-          break;
-        case 'bigint':
-          type = column.EXTRA === 'auto_increment' ? 'BIGSERIAL' : 'BIGINT';
-          break;
-        case 'datetime':
-          type = 'TIMESTAMP';
-          break;
-        case 'longtext':
-        case 'varchar':
-          type = 'TEXT';
-          break;
-        case 'tinyint':
-          type = 'SMALLINT';
-          break;
-        case 'decimal':
-        case 'numeric':
-          type = `NUMERIC(${column.NUMERIC_PRECISION || 10}, ${column.NUMERIC_SCALE || 2})`;
-          break;
+      if (!columns || columns.length === 0) {
+        throw new Error(`No columns found for table ${tableName}`);
       }
 
-      let definition = `"${column.COLUMN_NAME}" ${type}`;
+      console.log(`Found ${columns.length} columns for table ${tableName}`);
 
-      if (column.IS_NULLABLE === 'NO') {
-        if (type !== 'SERIAL' && type !== 'BIGSERIAL') {
-          definition += ' NOT NULL';
-          if (column.COLUMN_DEFAULT === null) {
-            switch (type) {
-              case 'INTEGER':
-              case 'BIGINT':
-              case 'SMALLINT':
-                definition += ' DEFAULT 0';
-                break;
-              case 'TEXT':
-                definition += ` DEFAULT ''`;
-                break;
-              case 'TIMESTAMP':
-                definition += ` DEFAULT CURRENT_TIMESTAMP`;
-                break;
-              case 'NUMERIC':
-                definition += ' DEFAULT 0';
-                break;
+      let createTableSQL = `CREATE TABLE "${tableName}" (`;
+      const columnDefinitions = columns.map((column) => {
+        let type = column['DATA_TYPE'].toLowerCase();
+
+        switch (type) {
+          case 'int':
+            type = column.EXTRA === 'auto_increment' ? 'SERIAL' : 'INTEGER';
+            break;
+          case 'bigint':
+            type = column.EXTRA === 'auto_increment' ? 'BIGSERIAL' : 'BIGINT';
+            break;
+          case 'datetime':
+            type = 'TIMESTAMP';
+            break;
+          case 'longtext':
+          case 'varchar':
+            type = 'TEXT';
+            break;
+          case 'tinyint':
+            type = 'SMALLINT';
+            break;
+          case 'decimal':
+          case 'numeric':
+            type = `NUMERIC(${column.NUMERIC_PRECISION || 10}, ${column.NUMERIC_SCALE || 2})`;
+            break;
+        }
+
+        let definition = `"${column.COLUMN_NAME}" ${type}`;
+
+        if (column.IS_NULLABLE === 'NO') {
+          if (type !== 'SERIAL' && type !== 'BIGSERIAL') {
+            definition += ' NOT NULL';
+            if (column.COLUMN_DEFAULT === null) {
+              switch (type) {
+                case 'INTEGER':
+                case 'BIGINT':
+                case 'SMALLINT':
+                  definition += ' DEFAULT 0';
+                  break;
+                case 'TEXT':
+                  definition += ` DEFAULT ''`;
+                  break;
+                case 'TIMESTAMP':
+                  definition += ` DEFAULT CURRENT_TIMESTAMP`;
+                  break;
+                case 'NUMERIC':
+                  definition += ' DEFAULT 0';
+                  break;
+              }
             }
           }
         }
-      }
 
-      if (column.COLUMN_DEFAULT !== null && !['SERIAL', 'BIGSERIAL'].includes(type)) {
-        definition += ` DEFAULT ${column.COLUMN_DEFAULT}`;
-      }
-
-      if (column.COLUMN_KEY === 'PRI' && !['SERIAL', 'BIGSERIAL'].includes(type)) {
-        definition += ' PRIMARY KEY';
-      }
-
-      return definition;
-    });
-
-    createTableSQL += columnDefinitions.join(', ') + ')';
-
-    await transactionalEntityManager.query(`DROP TABLE IF EXISTS "${tableName}" CASCADE`);
-    await transactionalEntityManager.query(createTableSQL);
-
-    await this.migrateTableData(mysqlConnection, transactionalEntityManager, tableName, columns, progress);
-
-    const foreignKeys = await mysqlConnection.query(`
-      SELECT 
-        COLUMN_NAME,
-        REFERENCED_TABLE_NAME,
-        REFERENCED_COLUMN_NAME
-      FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-      WHERE TABLE_SCHEMA = ?
-        AND TABLE_NAME = ? 
-        AND REFERENCED_TABLE_NAME IS NOT NULL
-    `, [mysqlConfig.database, tableName]);
-
-    for (const fk of foreignKeys) {
-      try {
-        const [{ exists }] = await transactionalEntityManager.query(`
-          SELECT EXISTS (
-            SELECT 1 
-            FROM information_schema.tables 
-            WHERE table_name = $1
-          ) as exists
-        `, [fk.REFERENCED_TABLE_NAME.toLowerCase()]);
-
-        if (!exists) {
-          console.warn(`Referenced table "${fk.REFERENCED_TABLE_NAME}" does not exist yet. Skipping foreign key for ${tableName}.${fk.COLUMN_NAME}`);
-          continue;
+        if (column.COLUMN_DEFAULT !== null && !['SERIAL', 'BIGSERIAL'].includes(type)) {
+          definition += ` DEFAULT ${column.COLUMN_DEFAULT}`;
         }
 
-        await transactionalEntityManager.query(`
-          ALTER TABLE "${tableName}" 
-          ADD CONSTRAINT "FK_${tableName}_${fk.COLUMN_NAME}" 
-          FOREIGN KEY ("${fk.COLUMN_NAME}") 
-          REFERENCES "${fk.REFERENCED_TABLE_NAME}" ("${fk.REFERENCED_COLUMN_NAME}")
-        `);
-      } catch (err) {
-        console.warn(`Failed to add foreign key for ${tableName}.${fk.COLUMN_NAME}:`, err.message);
+        if (column.COLUMN_KEY === 'PRI' && !['SERIAL', 'BIGSERIAL'].includes(type)) {
+          definition += ' PRIMARY KEY';
+        }
+
+        return definition;
+      });
+
+      createTableSQL += columnDefinitions.join(', ') + ')';
+
+      console.log(`Dropping existing table if exists: ${tableName}`);
+      await transactionalEntityManager.query(`DROP TABLE IF EXISTS "${tableName}" CASCADE`);
+      
+      console.log(`Creating table: ${tableName}`);
+      await transactionalEntityManager.query(createTableSQL);
+      
+      console.log(`Table ${tableName} created successfully`);
+
+      // Ma'lumotlarni ko'chirish
+      await this.migrateTableData(mysqlConnection, transactionalEntityManager, tableName, columns, progress);
+
+      // Jadval yaratilganini tekshirish
+      const [{ exists }] = await transactionalEntityManager.query(`
+        SELECT EXISTS (
+          SELECT 1 
+          FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = $1
+        ) as exists
+      `, [tableName.toLowerCase()]);
+
+      if (!exists) {
+        throw new Error(`Failed to create table ${tableName}`);
       }
+
+      console.log(`Successfully completed migration for table: ${tableName}`);
+    } catch (error) {
+      console.error(`Error migrating table ${tableName}:`, error);
+      throw error;
     }
   }
 
@@ -456,7 +573,7 @@ export class MigrationService {
     await transactionalEntityManager.query(createTableSQL);
 
     const [{ count }] = await mysqlConnection.query(
-      `SELECT COUNT(*) as count FROM ${tableName}`,
+      `SELECT COUNT(*) as count FROM \`${tableName}\``,
     );
     
     console.log(`Total records in ${tableName}: ${count}`);
@@ -483,7 +600,7 @@ export class MigrationService {
       console.log(`Processing batch ${batch + 1}/${totalBatches} (offset: ${offset})`);
 
       const data = await mysqlConnection.query(
-        `SELECT * FROM ${tableName} LIMIT ? OFFSET ?`,
+        `SELECT * FROM \`${tableName}\` LIMIT ? OFFSET ?`,
         [this.BATCH_SIZE, offset],
       );
 
@@ -504,57 +621,150 @@ export class MigrationService {
   }
 
   private async migrateTableData(
-      mysqlConnection: DataSource,
-      transactionalEntityManager: any,
-      tableName: string,
-      columns: any[],
-      progress: any
-    ): Promise<void> {
-      const [{ count }] = await mysqlConnection.query(
-        `SELECT COUNT(*) as count FROM ${tableName}`,
-      );
+    mysqlConnection: DataSource,
+    transactionalEntityManager: any,
+    tableName: string,
+    columns: any[],
+    progress: any
+  ): Promise<void> {
+    const [{ count }] = await mysqlConnection.query(
+      `SELECT COUNT(*) as count FROM \`${tableName}\``,
+    );
+    
+    console.log(`\nMigrating data for table: ${tableName}`);
+    console.log(`Total records in current table: ${count}`);
+
+    const totalBatches = Math.ceil(count / this.BATCH_SIZE);
+    console.log(`Will process in ${totalBatches} batches`);
+
+    let startBatch = 0;
+    if (progress && progress.tableName === tableName) {
+      startBatch = Math.floor(progress.lastOffset / this.BATCH_SIZE);
+    }
+
+    let totalMigrated = startBatch * this.BATCH_SIZE;
+    const startTime = Date.now();
+
+    for (let batch = startBatch; batch < totalBatches; batch++) {
+      const offset = batch * this.BATCH_SIZE;
       
-      console.log(`Total records in ${tableName}: ${count}`);
-  
-      const totalBatches = Math.ceil(count / this.BATCH_SIZE);
-      console.log(`Will process in ${totalBatches} batches`);
-  
-      let startBatch = 0;
-      if (progress && progress.tableName === tableName) {
-        startBatch = Math.floor(progress.lastOffset / this.BATCH_SIZE);
+      if (batch % 10 === 0) {
+        global.gc?.();
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
-  
-      let totalMigrated = startBatch * this.BATCH_SIZE;
-      const startTime = Date.now();
-  
-      for (let batch = startBatch; batch < totalBatches; batch++) {
-        const offset = batch * this.BATCH_SIZE;
+
+      const data = await mysqlConnection.query(
+        `SELECT * FROM \`${tableName}\` LIMIT ? OFFSET ?`,
+        [this.BATCH_SIZE, offset],
+      );
+
+      if (data.length > 0) {
+        await this.insertBatch(transactionalEntityManager, tableName, columns, data);
+
+        totalMigrated += data.length;
+        const elapsedMinutes = (Date.now() - startTime) / 60000;
+        const remainingRecords = count - totalMigrated;
+        const estimatedMinutes = (remainingRecords * elapsedMinutes) / totalMigrated;
+
+        // Progress bar va statistikani chiqarish
+        const progress = Math.round(totalMigrated/count*100);
+        const progressBar = '='.repeat(progress/2) + '-'.repeat(50-progress/2);
         
-        if (batch % 10 === 0) {
-          global.gc?.();
-          await new Promise(resolve => setTimeout(resolve, 100));
-        }
-  
-        console.log(`Processing batch ${batch + 1}/${totalBatches} (offset: ${offset})`);
-  
-        const data = await mysqlConnection.query(
-          `SELECT * FROM ${tableName} LIMIT ? OFFSET ?`,
-          [this.BATCH_SIZE, offset],
-        );
-  
-        if (data.length > 0) {
-          await this.insertBatch(transactionalEntityManager, tableName, columns, data);
-  
-          totalMigrated += data.length;
-          const elapsedMinutes = (Date.now() - startTime) / 60000;
-          const remainingRecords = count - totalMigrated;
-          const estimatedMinutes = (remainingRecords * elapsedMinutes) / totalMigrated;
-  
-          console.log(`Progress: ${totalMigrated}/${count} (${Math.round(totalMigrated/count*100)}%)`);
-          console.log(`Estimated time remaining: ${Math.round(estimatedMinutes)} minutes`);
-  
-          await this.saveProgress(tableName, offset + data.length);
-        }
+        // Progress ma'lumotlarini tozaroq ko'rsatish
+        console.clear(); // Ekranni tozalash
+        console.log('\n=== Current Migration Progress ===');
+        console.log(`Table: ${tableName}`);
+        console.log(`[${progressBar}] ${progress}%`);
+        console.log(`Records: ${totalMigrated}/${count}`);
+        console.log(`Batch: ${batch + 1}/${totalBatches}`);
+        console.log(`Estimated time remaining: ${Math.round(estimatedMinutes)} minutes`);
+        console.log('================================\n');
+
+        await this.saveProgress(tableName, offset + data.length);
       }
     }
+  }
+
+  private async addForeignKeyConstraints(
+    mysqlConnection: DataSource,
+    transactionalEntityManager: any,
+    tableName: string
+  ): Promise<Array<{
+    tableName: string;
+    columnName: string;
+    referencedTable: string;
+    referencedColumn: string;
+  }>> {
+    const failedForeignKeys: Array<{
+      tableName: string;
+      columnName: string;
+      referencedTable: string;
+      referencedColumn: string;
+    }> = [];
+
+    // Avval jadval mavjudligini tekshirish
+    const [{ exists }] = await transactionalEntityManager.query(`
+      SELECT EXISTS (
+        SELECT 1 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        AND table_name = $1
+      ) as exists
+    `, [tableName.toLowerCase()]);
+
+    if (!exists) {
+      throw new Error(`Table ${tableName} does not exist in PostgreSQL`);
+    }
+
+    const foreignKeys = await mysqlConnection.query(`
+      SELECT 
+        COLUMN_NAME,
+        REFERENCED_TABLE_NAME,
+        REFERENCED_COLUMN_NAME
+      FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+      WHERE TABLE_SCHEMA = ?
+        AND TABLE_NAME = ? 
+        AND REFERENCED_TABLE_NAME IS NOT NULL
+    `, [mysqlConfig.database, tableName]);
+
+    for (const fk of foreignKeys) {
+      try {
+        // Referenced jadval mavjudligini tekshirish
+        const [{ exists: referencedExists }] = await transactionalEntityManager.query(`
+          SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public'
+            AND table_name = $1
+          ) as exists
+        `, [fk.REFERENCED_TABLE_NAME.toLowerCase()]);
+
+        if (!referencedExists) {
+          console.warn(`Referenced table ${fk.REFERENCED_TABLE_NAME} does not exist. Skipping foreign key.`);
+          continue;
+        }
+
+        await transactionalEntityManager.query(`
+          ALTER TABLE "${tableName}" 
+          ADD CONSTRAINT "FK_${tableName}_${fk.COLUMN_NAME}" 
+          FOREIGN KEY ("${fk.COLUMN_NAME}") 
+          REFERENCES "${fk.REFERENCED_TABLE_NAME}" ("${fk.REFERENCED_COLUMN_NAME}")
+          ON DELETE CASCADE
+          ON UPDATE CASCADE
+        `);
+        console.log(`Added foreign key for ${tableName}.${fk.COLUMN_NAME}`);
+      } catch (err) {
+        console.error(`Failed to add foreign key for ${tableName}.${fk.COLUMN_NAME}:`, err);
+        failedForeignKeys.push({
+          tableName,
+          columnName: fk.COLUMN_NAME,
+          referencedTable: fk.REFERENCED_TABLE_NAME,
+          referencedColumn: fk.REFERENCED_COLUMN_NAME
+        });
+        console.warn('Continuing despite foreign key error');
+      }
+    }
+
+    return failedForeignKeys;
+  }
 }

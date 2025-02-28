@@ -6,7 +6,7 @@ export const mysqlConfig: DataSourceOptions = {
   port: 3306,
   username: 'root',
   password: '1',
-  database: 'fake-data',
+  database: 'store',
   synchronize: false,
   extra: {
     connectionLimit: 10,
@@ -21,7 +21,7 @@ export const postgresConfig: DataSourceOptions = {
   port: 5432,
   username: 'postgres',
   password: '1',
-  database: 'convert3',
+  database: 'laravel',
   synchronize: false,
   dropSchema: true,
   extra: {
