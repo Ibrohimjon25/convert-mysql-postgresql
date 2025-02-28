@@ -620,6 +620,8 @@ export class MigrationService {
     }
   }
 
+
+  
   private async migrateTableData(
     mysqlConnection: DataSource,
     transactionalEntityManager: any,
