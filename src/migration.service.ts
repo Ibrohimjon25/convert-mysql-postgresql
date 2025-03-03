@@ -4,40 +4,6 @@ import { mysqlConfig, postgresConfig } from './database.config';
 import * as fs from 'fs';
 import * as path from 'path';
 
-function formatValue(value: any, type: string): string {
-  if (value === null || value === undefined || value === "null") {
-    if (type === 'timestamp' || type === 'datetime') {
-      return 'NULL';
-    }
-    return 'NULL';
-  }
-
-  if (type === 'timestamp' || type === 'datetime') {
-    try {
-      const date = new Date(value);
-      if (!isNaN(date.valueOf())) {
-        // UTC formatida saqlash
-        return `'${date.toISOString().slice(0, 19).replace('T', ' ')}'`;
-      }
-      return 'NULL';
-    } catch (err) {
-      console.error(`Error parsing date: ${value}`, err);
-      return 'NULL';
-    }
-  } else if (type === 'text' || type === 'varchar' || type === 'longtext') {
-    return `'${value.toString().replace(/'/g, "''")}'`;
-  } else if (['integer', 'bigint', 'smallint', 'numeric'].includes(type)) {
-    const numValue = Number(value);
-    if (isNaN(numValue)) {
-      console.warn(`Invalid numeric value: ${value}. Using NULL.`);
-      return 'NULL';
-    }
-    return numValue.toString();
-  } else {
-    return `'${value}'`;
-  }
-}
-
 @Injectable()
 export class MigrationService {
   private readonly BATCH_SIZE = 500; 
@@ -261,23 +227,31 @@ export class MigrationService {
       const tableOrder = await this.getMigrationOrder(mysqlConnection);
       const progress = await this.loadProgress();
 
+      // Total records sonini hisoblash
       let totalRecordsCount = 0;
-      let currentProgress = 0;
-      const tableRecordCounts = new Map<string, number>();
-
-      // Barcha jadvallardagi ma'lumotlar sonini hisoblash
+      console.log('Calculating total records...');
+      
       for (const tableName of tableOrder) {
-        const [{ count }] = await mysqlConnection.query(
-          `SELECT COUNT(*) as count FROM \`${tableName}\``,
-        );
-        totalRecordsCount += count;
-        tableRecordCounts.set(tableName, count);
+        try {
+          const [result] = await mysqlConnection.query(
+            `SELECT COUNT(*) as count FROM \`${tableName}\``
+          );
+          const count = parseInt(result.count);
+          if (!isNaN(count)) {
+            totalRecordsCount += count;
+            console.log(`${tableName}: ${count} records`);
+          } else {
+            console.warn(`Invalid count for table ${tableName}`);
+          }
+        } catch (error) {
+          console.error(`Error counting records in ${tableName}:`, error);
+        }
       }
 
       console.log(`Total records to migrate: ${totalRecordsCount}`);
 
       const totalProgress = { 
-        current: currentProgress, 
+        current: 0,
         total: totalRecordsCount 
       };
 
@@ -310,6 +284,7 @@ export class MigrationService {
           });
           
           migratedTables.set(tableName, tableName.toLowerCase());
+          console.log(`\nCompleted ${tableName}. Total Progress: ${Math.round((totalProgress.current/totalProgress.total)*100)}%`);
         } catch (error) {
           console.error(`\nError migrating table ${tableName}:`, error);
           failedTables.add(tableName);
