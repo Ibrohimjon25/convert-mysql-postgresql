@@ -5,7 +5,7 @@ import { MigrationService } from './migration.service';
 export class MigrationController {
   constructor(private readonly migrationService: MigrationService) {}
 
-  @Get('mysql-to-postgres')
+  @Post('mysql-to-postgres')
   async migrateMySQLToPostgres() {
     return await this.migrationService.migrateData();
   }
