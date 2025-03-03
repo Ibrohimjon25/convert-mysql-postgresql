@@ -21,7 +21,7 @@ export const postgresConfig: DataSourceOptions = {
   port: 5432,
   username: 'postgres',
   password: '1',
-  database: 'laravel2',
+  database: 'laravel4',
   synchronize: false,
   dropSchema: true,
   extra: {

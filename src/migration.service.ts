@@ -101,8 +101,8 @@ export class MigrationService {
         if (value === null || value === undefined) return isNullable ? 'NULL' : '0';
         if (type.includes('int') || type === 'numeric' || type === 'double') return value;
         if (type === 'timestamp' || type === 'datetime') {
-          const date = new Date(value);
-          return `'${date.toISOString().slice(0, 19).replace('T', ' ')}'`;
+          // MySQL’dan kelgan vaqtni string sifatida saqlaymiz
+          return `'${value}'`; // Bu yerda value string sifatida keladi
         }
         return `'${value.toString().replace(/'/g, "''")}'`;
       });
@@ -230,7 +230,17 @@ export class MigrationService {
 
     for (let batch = startBatch; batch < totalBatches; batch++) {
       const offset = batch * this.BATCH_SIZE;
-      const data = await mysqlConnection.query(`SELECT * FROM \`${tableName}\` LIMIT ? OFFSET ?`, [this.BATCH_SIZE, offset]);
+      // Vaqt ustunlarini string sifatida olish uchun CAST ishlatamiz
+      const selectQuery = `
+        SELECT ${columns.map(col => 
+          col.DATA_TYPE.toLowerCase() === 'timestamp' || col.DATA_TYPE.toLowerCase() === 'datetime' 
+            ? `CAST(\`${col.COLUMN_NAME}\` AS CHAR) AS \`${col.COLUMN_NAME}\`` 
+            : `\`${col.COLUMN_NAME}\``
+        ).join(', ')} 
+        FROM \`${tableName}\` 
+        LIMIT ? OFFSET ?
+      `;
+      const data = await mysqlConnection.query(selectQuery, [this.BATCH_SIZE, offset]);
 
       if (data.length > 0) {
         await this.insertBatch(transactionalEntityManager, tableName, columns, data);
