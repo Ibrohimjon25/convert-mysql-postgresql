@@ -12,7 +12,7 @@ export const mysqlConfig: DataSourceOptions = {
     connectionLimit: 10,
     maxIdle: 10,
     idleTimeout: 60000,
-  }
+  },
 };
 
 export const postgresConfig: DataSourceOptions = {
@@ -21,28 +21,26 @@ export const postgresConfig: DataSourceOptions = {
   port: 5432,
   username: 'postgres',
   password: '1',
-  database: 'laravel4',
+  database: 'laravel',
   synchronize: false,
   dropSchema: true,
   extra: {
     max: 20,
     maxUses: 7500,
     idleTimeoutMillis: 30000,
-    timezone: '+05:00',
-    // PostgreSQL specific settings for foreign keys
+    timezone: 'UTC', // +05:00 o'rniga UTC qo'yamiz
     session_replication_role: 'replica',
-    // Add these settings
     statement_timeout: 0,
     lock_timeout: 0,
     idle_in_transaction_session_timeout: 0,
-    application_name: 'migration'
+    application_name: 'migration',
   },
-  logging: ["query", "error", "schema"],
-  maxQueryExecutionTime: 300000, // Increased to 5 minutes
+  logging: ['query', 'error', 'schema'],
+  maxQueryExecutionTime: 300000, // 5 daqiqa
   entitySkipConstructor: true,
   migrationsRun: false,
-  migrationsTransactionMode: "none", // Changed to handle constraints better
+  migrationsTransactionMode: 'none',
   installExtensions: false,
   ssl: false,
-  cache: false
+  cache: false,
 };
