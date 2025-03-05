@@ -74,6 +74,14 @@ export class MigrationService {
     return order;
   }
 
+  private formatDateToYYYYMMDD(value: string | Date): string {
+    const date = new Date(value);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
   private async insertBatch(
     transactionalEntityManager: any,
     tableName: string,
@@ -92,7 +100,25 @@ export class MigrationService {
         if (value === null || value === undefined) return isNullable ? 'NULL' : '0';
         if (type.includes('int') || type === 'numeric' || type === 'double') return value;
         if (type === 'timestamp' || type === 'datetime') {
-          return `'${new Date(value).toISOString()}'`;
+          // MySQL’dan kelgan qiymatni o‘zgartirmasdan ishlatamiz
+          if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) {
+            return `'${value}'`; // YYYY-MM-DD HH:MM:SS formatida bo‘lsa, shunday saqlaymiz
+          }
+          // Agar qiymat boshqa formatda bo‘lsa, uni to‘g‘ri formatga keltiramiz
+          const date = new Date(value);
+          const year = date.getFullYear();
+          const month = String(date.getMonth() + 1).padStart(2, '0');
+          const day = String(date.getDate()).padStart(2, '0');
+          const hours = String(date.getHours()).padStart(2, '0');
+          const minutes = String(date.getMinutes()).padStart(2, '0');
+          const seconds = String(date.getSeconds()).padStart(2, '0');
+          return `'${year}-${month}-${day} ${hours}:${minutes}:${seconds}'`;
+        }
+        if (type === 'date') {
+          if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+            return `'${value}'`;
+          }
+          return `'${this.formatDateToYYYYMMDD(value)}'`;
         }
         return `'${value.toString().replace(/'/g, "''")}'`;
       });
@@ -105,7 +131,7 @@ export class MigrationService {
       result = await transactionalEntityManager.query(query);
     } catch (error) {
       console.error(`PostgreSQL insert failed for ${tableName}:`, error.message);
-      throw error; // Xatolikni yuqoriga ko‘tarish
+      throw error;
     }
 
     const insertedRows = result ? result.length : 0;
@@ -210,7 +236,10 @@ export class MigrationService {
           break;
         case 'datetime':
         case 'timestamp':
-          type = 'TIMESTAMPTZ';
+          type = 'TIMESTAMP'; // Vaqt mintaqasisiz TIMESTAMP
+          break;
+        case 'date':
+          type = 'DATE';
           break;
         case 'double':
           type = 'DOUBLE PRECISION';
@@ -231,28 +260,32 @@ export class MigrationService {
 
     const [{ count: mysqlCount }] = await mysqlConnection.query(`SELECT COUNT(*) as count FROM \`${tableName}\``);
     let startOffset = progress && progress.tableName === tableName ? progress.lastOffset : 0;
-    let processedRows = 0;
+
+    if (startOffset >= mysqlCount) startOffset = 0;
+
+    let processedRows = startOffset;
 
     while (processedRows < mysqlCount) {
       const selectQuery = `SELECT * FROM \`${tableName}\` LIMIT ? OFFSET ?`;
-      const data = await mysqlConnection.query(selectQuery, [this.BATCH_SIZE, startOffset]);
+      const data = await mysqlConnection.query(selectQuery, [this.BATCH_SIZE, processedRows]);
 
-      if (data.length === 0) {
-        if (processedRows < mysqlCount) {
-          throw new Error(`No data returned for ${tableName} at offset ${startOffset}, expected ${mysqlCount - processedRows} more rows`);
-        }
-        break;
+      if (data.length === 0 && processedRows < mysqlCount) {
+        console.error(`No data returned for ${tableName} at offset ${processedRows}, expected ${mysqlCount - processedRows} more rows`);
+        throw new Error(`No data returned for ${tableName} at offset ${processedRows}, expected ${mysqlCount - processedRows} more rows`);
       }
 
-      try {
-        await this.insertBatch(transactionalEntityManager, tableName, columns, data);
-        processedRows += data.length;
-        startOffset += data.length;
-        totalProgress.current += data.length;
-        await this.saveProgress(tableName, startOffset);
-      } catch (error) {
-        console.error(`Failed to process batch for ${tableName} at offset ${startOffset}:`, error.message);
-        throw error;
+      if (data.length > 0) {
+        try {
+          await this.insertBatch(transactionalEntityManager, tableName, columns, data);
+          processedRows += data.length;
+          await this.saveProgress(tableName, processedRows);
+          totalProgress.current += data.length;
+        } catch (error) {
+          console.error(`Failed to process batch for ${tableName} at offset ${processedRows}:`, error.message);
+          throw error;
+        }
+      } else {
+        break;
       }
     }
 
